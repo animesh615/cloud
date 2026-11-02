@@ -1,76 +1,201 @@
-import socket
-import threading
+
+import argparse
+import csv
 import json
+import threading
 import time
-import sys
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import URLError, HTTPError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
-# Server registry (will be updated dynamically by the autoscaler later)
-servers = [("127.0.0.1", 5000)]
-server_index = 0
-registry_lock = threading.Lock()
+parser = argparse.ArgumentParser()
+parser.add_argument("--server", default="http://192.168.122.236:8000")
+args = parser.parse_args()
 
-stats = {"completed": 0, "failed": 0, "total_latency": 0.0}
-stats_lock = threading.Lock()
+lock = threading.Lock()
+servers = [args.server.rstrip("/")]
+mode = "stopped"
+shutdown = threading.Event()
 
-def get_next_server():
-    global server_index
-    with registry_lock:
-        server = servers[server_index % len(servers)]
-        server_index += 1
-        return server
+LOW_RATE = 1       # requests per second
+HIGH_RATE = 12      # requests per second
+MAX_WORKERS = 32
+COMPUTE_N = 100000
 
-def send_request(request_id, work_units):
-    server_ip, server_port = get_next_server()
+csv_lock = threading.Lock()
+csv_file = open("client_metrics.csv", "w", newline="")
+writer = csv.writer(csv_file)
+writer.writerow([
+    "timestamp", "mode" , "server", "success",
+    "latency_seconds", "compute_seconds"
+])
+csv_file.flush()
+
+
+def send_request(url, request_mode):
+    started = time.perf_counter()
+    success = False
+    compute_seconds = ""
+    server_name = url
+
     try:
-        start_time = time.time()
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5.0)
-        s.connect((server_ip, server_port))
-        
-        req = {"request_id": request_id, "work_units": work_units}
-        s.sendall(json.dumps(req).encode('utf-8'))
-        
-        data = s.recv(1024).decode('utf-8')
-        latency = time.time() - start_time
-        
-        with stats_lock:
-            stats["completed"] += 1
-            stats["total_latency"] += latency
-    except Exception as e:
-        with stats_lock:
-            stats["failed"] += 1
+        request_url = f"{url}/compute?n={COMPUTE_N}"
+        with urlopen(request_url, timeout=60) as response:
+            data = json.loads(response.read().decode())
+
+        server_name = data.get("hostname", url)
+        compute_seconds = data.get("compute_seconds", "")
+        success = True
+
+    except (URLError, HTTPError, TimeoutError, ValueError, OSError) as exc:
+        print(f"\nRequest to {url} failed: {exc}")
+
+    latency = time.perf_counter() - started
+
+    with csv_lock:
+        writer.writerow([
+            time.time(),
+            request_mode,
+            server_name, 
+            success,
+            round(latency, 4),
+            compute_seconds
+        ])
+        csv_file.flush()
+
+    return success, latency, server_name
+
+
+class ControlHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != "/add_server":
+            self.send_error(404)
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            url = payload["url"].rstrip("/")
+            parsed = urlparse(url)
+
+            # Accept only HTTP endpoints on the libvirt NAT subnet.
+            if (parsed.scheme != "http"
+                    or parsed.hostname is None
+                    or not parsed.hostname.startswith("192.168.122.")
+                    or parsed.port != 8000
+                    or parsed.path not in ("", "/")):
+                self.send_error(400, "Invalid server URL")
+                return
+
+            with lock:
+                if url not in servers:
+                    servers.append(url)
+
+            body = json.dumps({"servers": servers}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            print(f"\nNew server registered: {url}")
+
+        except Exception as exc:
+            self.send_error(400, str(exc))
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def start_control_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 9000), ControlHandler)
+    server.timeout = 1
+
+    while not shutdown.is_set():
+        server.handle_request()
+
+    server.server_close()
+
+
+def load_generator():
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    pending = set()
+
+    try:
+        while not shutdown.is_set():
+            # Collect completed requests without blocking submission.
+            completed = {f for f in pending if f.done()}
+            for future in completed:
+                pending.remove(future)
+                try:
+                    ok, latency, hostname = future.result()
+                    if ok:
+                        pass
+                            
+                            
+                            
+                            
+                        
+                except Exception as exc:
+                    print(f"\nWorker error: {exc}")
+
+            with lock:
+                current_mode = mode
+                current_servers = list(servers)
+
+            if current_mode == "stopped":
+                time.sleep(0.1)
+                continue
+
+            rate = LOW_RATE if current_mode == "low" else HIGH_RATE
+            interval = 1.0 / rate
+            started = time.monotonic()
+
+            if len(pending) < MAX_WORKERS:
+                # Round-robin distribution across registered servers.
+                with lock:
+                    index = load_generator.server_index % len(servers)
+                    url = servers[index]
+                    load_generator.server_index += 1
+
+                pending.add(executor.submit(send_request, url,current_mode))
+
+            elapsed = time.monotonic() - started
+            shutdown.wait(max(0, interval - elapsed))
+
     finally:
-        s.close()
+        executor.shutdown(wait=False, cancel_futures=True)
 
-def run_load_test(rps, work_units, duration):
-    print(f"Sending {rps} req/sec for {duration}s (Work units: {work_units})")
-    threads = []
-    
-    for i in range(rps * duration):
-        t = threading.Thread(target=send_request, args=(i, work_units))
-        threads.append(t)
-        t.start()
-        time.sleep(1.0 / rps)
-        
-    for t in threads:
-        t.join()
-        
-    avg_latency = (stats["total_latency"] / stats["completed"]) if stats["completed"] > 0 else 0
-    print(f"\n--- Results ---")
-    print(f"Completed: {stats['completed']}")
-    print(f"Failed:    {stats['failed']}")
-    print(f"Avg Latency: {avg_latency:.3f}s")
 
-if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "low"
-    
-    # Adjust work_units based on how fast your Linux CPU is
-    work_units = 50000 
-    duration = 10
-    
-    if mode == "high":
-        rps = 10
-    else:
-        rps = 2
-        
-    run_load_test(rps, work_units, duration)
+load_generator.server_index = 0
+
+threading.Thread(target=start_control_server, daemon=True).start()
+threading.Thread(target=load_generator, daemon=True).start()
+
+print("Client ready. Control endpoint: http://127.0.0.1:9000")
+print("Commands: low, high, stop, status, quit")
+
+try:
+    while True:
+        command = input("> ").strip().lower()
+
+        if command in ("low", "high", "stop"):
+            with lock:
+                mode = "stopped" if command == "stop" else command
+            print(f"Load mode: {mode}")
+
+        elif command == "status":
+            with lock:
+                print(f"Mode: {mode}")
+                print(f"Servers: {servers}")
+
+        elif command == "quit":
+            break
+
+        else:
+            print("Enter low, high, stop, status, or quit.")
+
+finally:
+    shutdown.set()
+    csv_file.close()
